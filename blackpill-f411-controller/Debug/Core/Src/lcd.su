@@ -1,0 +1,16 @@
+../Core/Src/lcd.c:26:26:LCD_TransmitRaw	32	static
+../Core/Src/lcd.c:37:13:I2C_RecoveryDelay	16	static,ignoring_inline_asm
+../Core/Src/lcd.c:43:13:I2C_RecoverBus	40	static
+../Core/Src/lcd.c:88:19:I2C_MasterTransmitSafe	40	static
+../Core/Src/lcd.c:108:19:I2C_MasterReceiveSafe	40	static
+../Core/Src/lcd.c:128:9:LCD_ReinitRequested	4	static
+../Core/Src/lcd.c:132:6:LCD_ClearReinitRequest	4	static
+../Core/Src/lcd.c:170:6:LCD_LoadCustomChar	24	static
+../Core/Src/lcd.c:178:6:LCD_SendInternal	24	static
+../Core/Src/lcd.c:191:6:LCD_SendCommand	16	static
+../Core/Src/lcd.c:195:6:LCD_SendData	16	static
+../Core/Src/lcd.c:199:6:LCD_WriteNibble	24	static
+../Core/Src/lcd.c:237:6:LCD_Init	8	static
+../Core/Src/lcd.c:299:6:LCD_Clear	8	static
+../Core/Src/lcd.c:304:6:LCD_SetCursor	24	static
+../Core/Src/lcd.c:373:6:LCD_Print	24	static

@@ -1,0 +1,57 @@
+--- upstream/NetworkClientSecure/src/NetworkClientSecure.cpp
++++ firmware/esp32s3-gateway/third_party/NetworkClientSecure/src/NetworkClientSecure.cpp
+@@ -235,6 +235,11 @@
+     return send_net_data(sslclient.get(), buf, size);
+   }
+
++  // setTimeout() is used by HTTPClient with the remaining absolute operation
++  // budget. Keep the TLS loop on that same budget instead of the connect-time
++  // socket_timeout captured by start_ssl_client().
++  sslclient->socket_timeout = _timeout;
++
+   if (_lastWriteTimeout != _timeout) {
+     struct timeval timeout_tv;
+     timeout_tv.tv_sec = _timeout / 1000;
+@@ -257,6 +262,8 @@
+     return get_net_receive(sslclient.get(), buf, size);
+   }
+
++  sslclient->socket_timeout = _timeout;
++
+   if (_lastReadTimeout != _timeout) {
+     if (fd() >= 0) {
+       struct timeval timeout_tv;
+--- upstream/NetworkClientSecure/src/ssl_client.cpp
++++ firmware/esp32s3-gateway/third_party/NetworkClientSecure/src/ssl_client.cpp
+@@ -415,10 +415,14 @@
+   }
+
+   static constexpr size_t max_write_chunk_size = 4096;
+-  unsigned long last_progress = millis();  // Timeout since last progress
++  const uint32_t writeStartedMs = millis();
+   size_t sent = 0;
+
+   while (sent < len) {
++    if ((millis() - writeStartedMs) >= ssl_client->socket_timeout) {
++      log_v("SSL write timed out.");
++      return -1;
++    }
+     size_t to_send = len - sent;
+     if (to_send > max_write_chunk_size) {
+       to_send = max_write_chunk_size;
+@@ -427,15 +431,9 @@
+     int ret = mbedtls_ssl_write(&ssl_client->ssl_ctx, data + sent, to_send);
+     if (ret > 0) {
+       sent += ret;
+-      last_progress = millis();  // refresh timeout window
+       continue;
+     }
+
+-    if ((millis() - last_progress) > ssl_client->socket_timeout) {
+-      log_v("SSL write timed out.");
+-      return -1;
+-    }
+-
+     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
+       log_v("Handling error %d", ret);
+       return handle_error(ret);

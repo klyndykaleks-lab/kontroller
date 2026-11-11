@@ -1,0 +1,312 @@
+--- upstream/WebServer/src/WebServer.h
++++ firmware/esp32s3-gateway/third_party/WebServer/src/WebServer.h
+@@ -112,6 +112,12 @@
+   virtual void close();
+   void stop();
+
++  // Project-local bounded request extension for VMC. Limits are absolute per
++  // request, not renewed for each received fragment or header line.
++  void setRequestLimits(uint32_t receiveTimeoutMs, uint32_t responseTimeoutMs,
++                        size_t maxHeaderBytes, size_t maxHeaderLineBytes,
++                        size_t maxHeaderCount, size_t maxBodyBytes);
++
+   const String AuthTypeDigest = F("Digest");
+   const String AuthTypeBasic = F("Basic");
+
+@@ -251,9 +257,25 @@
+
+ protected:
+   virtual size_t _currentClientWrite(const char *b, size_t l) {
++    if (!_responseDeadlineActive) {
++      _responseDeadlineMs = millis() + _responseWriteTimeoutMs;
++      _responseDeadlineActive = true;
++    }
++    const int32_t remaining =
++        static_cast<int32_t>(_responseDeadlineMs - millis());
++    if (remaining <= 0) return 0;
++    _currentClient.setTimeout(static_cast<uint32_t>(remaining));
+     return _currentClient.write(b, l);
+   }
+   virtual size_t _currentClientWrite_P(PGM_P b, size_t l) {
++    if (!_responseDeadlineActive) {
++      _responseDeadlineMs = millis() + _responseWriteTimeoutMs;
++      _responseDeadlineActive = true;
++    }
++    const int32_t remaining =
++        static_cast<int32_t>(_responseDeadlineMs - millis());
++    if (remaining <= 0) return 0;
++    _currentClient.setTimeout(static_cast<uint32_t>(remaining));
+     return _currentClient.write_P(b, l);
+   }
+   void _addRequestHandler(RequestHandler *handler);
+@@ -326,6 +348,15 @@
+   int _responseCode = 0;
+   bool _collectAllHeaders = false;
+   MiddlewareChain *_chain = nullptr;
++  uint32_t _requestReceiveTimeoutMs = HTTP_MAX_DATA_WAIT;
++  uint32_t _responseWriteTimeoutMs = HTTP_MAX_SEND_WAIT;
++  size_t _maxRequestHeaderBytes = SIZE_MAX;
++  size_t _maxRequestHeaderLineBytes = SIZE_MAX;
++  size_t _maxRequestHeaderCount = SIZE_MAX;
++  size_t _maxRequestBodyBytes = SIZE_MAX;
++  uint32_t _requestDeadlineMs = 0;
++  uint32_t _responseDeadlineMs = 0;
++  bool _responseDeadlineActive = false;
+ };
+
+ #endif  //ESP8266WEBSERVER_H
+--- upstream/WebServer/src/WebServer.cpp
++++ firmware/esp32s3-gateway/third_party/WebServer/src/WebServer.cpp
+@@ -419,6 +419,7 @@
+
+     _currentStatus = HC_WAIT_READ;
+     _statusChange = millis();
++    _requestDeadlineMs = _statusChange + _requestReceiveTimeoutMs;
+   }
+
+   bool keepCurrentClient = false;
+@@ -432,11 +433,12 @@
+       case HC_WAIT_READ:
+         // Wait for data from client to become available
+         if (_currentClient.available()) {
+-          _currentClient.setTimeout(HTTP_MAX_SEND_WAIT); /* / 1000 removed, WifiClient setTimeout changed to ms */
++          _currentClient.setTimeout(_requestReceiveTimeoutMs);
+           if (_parseRequest(_currentClient)) {
+             _contentLength = CONTENT_LENGTH_NOT_SET;
+             _responseCode = 0;
+             _clearResponseHeaders();
++            _responseDeadlineActive = false;
+
+             // Run server-level middlewares
+             if (_chain) {
+@@ -460,7 +462,7 @@
+             //           }
+           }
+         } else {  // !_currentClient.available()
+-          if (millis() - _statusChange <= HTTP_MAX_DATA_WAIT) {
++          if (static_cast<int32_t>(_requestDeadlineMs - millis()) > 0) {
+             keepCurrentClient = true;
+           }
+           callYield = true;
+@@ -484,6 +486,9 @@
+     _currentStatus = HC_NONE;
+     _currentUpload.reset();
+     _currentRaw.reset();
++    _requestDeadlineMs = 0;
++    _responseDeadlineMs = 0;
++    _responseDeadlineActive = false;
+   }
+
+   if (callYield) {
+@@ -491,6 +496,20 @@
+   }
+ }
+
++void WebServer::setRequestLimits(uint32_t receiveTimeoutMs,
++                                 uint32_t responseTimeoutMs,
++                                 size_t maxHeaderBytes,
++                                 size_t maxHeaderLineBytes,
++                                 size_t maxHeaderCount,
++                                 size_t maxBodyBytes) {
++  _requestReceiveTimeoutMs = receiveTimeoutMs;
++  _responseWriteTimeoutMs = responseTimeoutMs;
++  _maxRequestHeaderBytes = maxHeaderBytes;
++  _maxRequestHeaderLineBytes = maxHeaderLineBytes;
++  _maxRequestHeaderCount = maxHeaderCount;
++  _maxRequestBodyBytes = maxBodyBytes;
++}
++
+ void WebServer::close() {
+   _server.close();
+   _currentStatus = HC_NONE;
+@@ -734,7 +753,7 @@
+   }
+   _currentClientWrite(content, contentLength);
+   if (_chunked) {
+-    _currentClient.write(footer, 2);
++    _currentClientWrite(footer, 2);
+     if (contentLength == 0) {
+       _chunked = false;
+     }
+@@ -757,7 +776,7 @@
+   }
+   _currentClientWrite_P(content, size);
+   if (_chunked) {
+-    _currentClient.write(footer, 2);
++    _currentClientWrite(footer, 2);
+     if (size == 0) {
+       _chunked = false;
+     }
+--- upstream/WebServer/src/Parsing.cpp
++++ firmware/esp32s3-gateway/third_party/WebServer/src/Parsing.cpp
+@@ -41,42 +41,63 @@
+ static const char Content_Type[] PROGMEM = "Content-Type";
+ static const char filename[] PROGMEM = "filename";
+
+-static char *readBytesWithTimeout(NetworkClient &client, size_t maxLength, size_t &dataLength, int timeout_ms) {
+-  char *buf = nullptr;
+-  dataLength = 0;
+-  while (dataLength < maxLength) {
+-    int tries = timeout_ms;
+-    size_t newLength;
+-    while (!(newLength = client.available()) && tries--) {
++enum class BoundedReadResult { Ok, Timeout, TooLarge, Disconnected };
++
++static BoundedReadResult readLineBounded(
++    NetworkClient &client, String &line, uint32_t deadlineMs,
++    size_t maxLineBytes, size_t &totalBytes, size_t maxTotalBytes) {
++  line = String();
++  for (;;) {
++    if (static_cast<int32_t>(deadlineMs - millis()) <= 0) {
++      return BoundedReadResult::Timeout;
++    }
++    if (!client.connected()) return BoundedReadResult::Disconnected;
++    if (!client.available()) {
+       delay(1);
++      continue;
+     }
+-    if (!newLength) {
++    const int value = client.read();
++    if (value < 0) continue;
++    if (++totalBytes > maxTotalBytes) return BoundedReadResult::TooLarge;
++    if (value == '\n') {
++      if (line.endsWith("\r")) line.remove(line.length() - 1);
++      return BoundedReadResult::Ok;
++    }
++    if (line.length() >= maxLineBytes) return BoundedReadResult::TooLarge;
++    line += static_cast<char>(value);
++  }
++}
++
++static char *readBodyBounded(NetworkClient &client, size_t length,
++                             size_t &dataLength, uint32_t deadlineMs) {
++  char *buf = static_cast<char *>(malloc(length + 1));
++  if (!buf) return nullptr;
++  dataLength = 0;
++  while (dataLength < length) {
++    if (static_cast<int32_t>(deadlineMs - millis()) <= 0 ||
++        !client.connected()) {
+       break;
+     }
+-    if (!buf) {
+-      buf = (char *)malloc(newLength + 1);
+-      if (!buf) {
+-        return nullptr;
+-      }
+-    } else {
+-      char *newBuf = (char *)realloc(buf, dataLength + newLength + 1);
+-      if (!newBuf) {
+-        free(buf);
+-        return nullptr;
+-      }
+-      buf = newBuf;
++    if (!client.available()) {
++      delay(1);
++      continue;
+     }
+-    client.readBytes(buf + dataLength, newLength);
+-    dataLength += newLength;
+-    buf[dataLength] = '\0';
++    const int value = client.read();
++    if (value >= 0) buf[dataLength++] = static_cast<char>(value);
+   }
++  buf[dataLength] = '\0';
+   return buf;
+ }
+
+ bool WebServer::_parseRequest(NetworkClient &client) {
+   // Read the first line of HTTP request
+-  String req = client.readStringUntil('\r');
+-  client.readStringUntil('\n');
++  size_t headerBytes = 0;
++  size_t headerCount = 0;
++  String req;
++  BoundedReadResult readResult = readLineBounded(
++      client, req, _requestDeadlineMs, _maxRequestHeaderLineBytes,
++      headerBytes, _maxRequestHeaderBytes);
++  if (readResult != BoundedReadResult::Ok) return false;
+   //reset header value
+   if (_collectAllHeaders) {
+     // clear previous headers
+@@ -146,11 +167,14 @@
+     bool isEncoded = false;
+     //parse headers
+     while (1) {
+-      req = client.readStringUntil('\r');
+-      client.readStringUntil('\n');
++      readResult = readLineBounded(
++          client, req, _requestDeadlineMs, _maxRequestHeaderLineBytes,
++          headerBytes, _maxRequestHeaderBytes);
++      if (readResult != BoundedReadResult::Ok) return false;
+       if (req == "") {
+         break;  //no moar headers
+       }
++      if (++headerCount > _maxRequestHeaderCount) return false;
+       int headerDiv = req.indexOf(':');
+       if (headerDiv == -1) {
+         break;
+@@ -174,6 +198,12 @@
+         }
+       } else if (headerName.equalsIgnoreCase(F("Content-Length"))) {
+         _clientContentLength = headerValue.toInt();
++        if (_clientContentLength < 0 ||
++            static_cast<size_t>(_clientContentLength) >
++                _maxRequestBodyBytes) {
++          send(500, "application/json", "{}");
++          return false;
++        }
+       } else if (headerName.equalsIgnoreCase(F("Host"))) {
+         _hostHeader = headerValue;
+       }
+@@ -190,6 +220,10 @@
+       _currentRaw->status = RAW_WRITE;
+
+       while (_currentRaw->totalSize < (size_t)_clientContentLength) {
++        const int32_t remaining =
++            static_cast<int32_t>(_requestDeadlineMs - millis());
++        if (remaining <= 0) return false;
++        client.setTimeout(static_cast<uint32_t>(remaining));
+         size_t read_len = std::min((size_t)_clientContentLength - _currentRaw->totalSize, (size_t)HTTP_RAW_BUFLEN);
+         _currentRaw->currentSize = client.readBytes(_currentRaw->buf, read_len);
+         _currentRaw->totalSize += _currentRaw->currentSize;
+@@ -204,8 +238,10 @@
+       _currentHandler->raw(*this, _currentUri, *_currentRaw);
+       log_v("Finish Raw");
+     } else if (!isForm) {
+-      size_t plainLength;
+-      char *plainBuf = readBytesWithTimeout(client, _clientContentLength, plainLength, HTTP_MAX_POST_WAIT);
++      size_t plainLength = 0;
++      char *plainBuf = readBodyBounded(
++          client, static_cast<size_t>(_clientContentLength), plainLength,
++          _requestDeadlineMs);
+       if (plainLength < (size_t)_clientContentLength) {
+         free(plainBuf);
+         return false;
+@@ -234,6 +270,10 @@
+       }
+     } else {
+       // it IS a form
++      if (_maxRequestBodyBytes != SIZE_MAX) {
++        send(500, "application/json", "{}");
++        return false;
++      }
+       _parseArguments(searchStr);
+       if (!_parseForm(client, boundaryStr, _clientContentLength)) {
+         return false;
+@@ -244,11 +284,14 @@
+     String headerValue;
+     //parse headers
+     while (1) {
+-      req = client.readStringUntil('\r');
+-      client.readStringUntil('\n');
++      readResult = readLineBounded(
++          client, req, _requestDeadlineMs, _maxRequestHeaderLineBytes,
++          headerBytes, _maxRequestHeaderBytes);
++      if (readResult != BoundedReadResult::Ok) return false;
+       if (req == "") {
+         break;  //no moar headers
+       }
++      if (++headerCount > _maxRequestHeaderCount) return false;
+       int headerDiv = req.indexOf(':');
+       if (headerDiv == -1) {
+         break;

@@ -1,0 +1,4 @@
+../Core/Src/motor_control.c:8:6:MotorControlInit	16	static
+../Core/Src/motor_control.c:10:13:MotorFinish	16	static
+../Core/Src/motor_control.c:16:20:MotorControlStart	24	static
+../Core/Src/motor_control.c:39:6:MotorControlStep	40	static

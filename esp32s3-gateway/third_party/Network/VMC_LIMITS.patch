@@ -1,0 +1,58 @@
+--- upstream/Network/src/NetworkClient.h
++++ firmware/esp32s3-gateway/third_party/Network/src/NetworkClient.h
+@@ -92,6 +92,7 @@
+   int setSocketOption(int option, char *value, size_t len);
+   int setSocketOption(int level, int option, const void *value, size_t len);
+   int getSocketOption(int level, int option, const void *value, size_t size);
++  void setTimeout(unsigned long milliseconds);
+   int setOption(int option, int *value);
+   int getOption(int option, int *value);
+   void setConnectionTimeout(uint32_t milliseconds);
+--- upstream/Network/src/NetworkClient.cpp
++++ firmware/esp32s3-gateway/third_party/Network/src/NetworkClient.cpp
+@@ -361,6 +361,11 @@
+   int flag = 0;
+   getOption(TCP_NODELAY, &flag);
+   return flag;
++}
++
++void NetworkClient::setTimeout(unsigned long milliseconds) {
++  Stream::setTimeout(milliseconds);
++  _timeout = static_cast<int>(milliseconds);
+ }
+
+ size_t NetworkClient::write(uint8_t data) {
+@@ -389,19 +394,31 @@
+   int socketFileDescriptor = fd();
+   size_t totalBytesSent = 0;
+   size_t bytesRemaining = size;
++  const uint32_t writeStartedMs = millis();
+
+   if (!_connected || (socketFileDescriptor < 0)) {
+     return 0;
+   }
+
+   while (retry) {
++    const uint32_t elapsedMs = millis() - writeStartedMs;
++    if (_timeout >= 0 && elapsedMs >= static_cast<uint32_t>(_timeout)) {
++      break;
++    }
++
+     //use select to make sure the socket is ready for writing
+     fd_set set;
+     struct timeval tv;
+     FD_ZERO(&set);                       // empties the set
+     FD_SET(socketFileDescriptor, &set);  // adds FD to the set
+-    tv.tv_sec = 0;
+-    tv.tv_usec = WIFI_CLIENT_SELECT_TIMEOUT_US;
++    uint32_t waitUs = WIFI_CLIENT_SELECT_TIMEOUT_US;
++    if (_timeout >= 0) {
++      const uint32_t remainingMs = static_cast<uint32_t>(_timeout) - elapsedMs;
++      const uint32_t remainingUs = remainingMs * 1000U;
++      if (remainingUs < waitUs) waitUs = remainingUs;
++    }
++    tv.tv_sec = waitUs / 1000000U;
++    tv.tv_usec = waitUs % 1000000U;
+     retry--;
+
+     if (_lastWriteTimeout != _timeout) {

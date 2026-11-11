@@ -1,0 +1,48 @@
+diff --git a/firmware/esp32s3-gateway/third_party/Network/src/NetworkServer.cpp b/firmware/esp32s3-gateway/third_party/Network/src/NetworkServer.cpp
+index ce8ef952..d8f6a14d 100644
+--- a/firmware/esp32s3-gateway/third_party/Network/src/NetworkServer.cpp
++++ b/firmware/esp32s3-gateway/third_party/Network/src/NetworkServer.cpp
+@@ -67,6 +67,7 @@ NetworkClient NetworkServer::accept() {
+         return NetworkClient(client_sock);
+       }
+     }
++    lwip_close(client_sock);  // Configuration failed; no NetworkClient owns this fd.
+   }
+   return NetworkClient();
+ }
+@@ -111,13 +112,13 @@ void NetworkServer::begin(uint16_t port, int enable) {
+   memcpy((uint8_t *)&(server.sin_addr.s_addr), (uint8_t *)&_addr[0], 4);
+   server.sin_port = htons(_port);
+ #endif
+-  if (bind(sockfd, (struct sockaddr *)&server, sizeof(server)) < 0) {
++  if (bind(sockfd, (struct sockaddr *)&server, sizeof(server)) < 0 ||
++      listen(sockfd, _max_clients) < 0 ||
++      fcntl(sockfd, F_SETFL, O_NONBLOCK) < 0) {
++    lwip_close(sockfd);
++    sockfd = -1;
+     return;
+   }
+-  if (listen(sockfd, _max_clients) < 0) {
+-    return;
+-  }
+-  fcntl(sockfd, F_SETFL, O_NONBLOCK);
+   _listening = true;
+   _noDelay = false;
+   _accepted_sockfd = -1;
+@@ -154,11 +155,11 @@ bool NetworkServer::hasClient() {
+ }
+ 
+ void NetworkServer::end() {
+-#ifdef ESP_IDF_VERSION_MAJOR
+-  lwip_close(sockfd);
+-#else
+-  lwip_close_r(sockfd);
+-#endif
++  if (_accepted_sockfd >= 0) {
++    lwip_close(_accepted_sockfd);
++    _accepted_sockfd = -1;
++  }
++  if (sockfd >= 0) lwip_close(sockfd);
+   sockfd = -1;
+   _listening = false;
+ }

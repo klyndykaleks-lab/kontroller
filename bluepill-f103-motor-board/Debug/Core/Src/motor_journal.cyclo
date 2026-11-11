@@ -1,0 +1,7 @@
+../Core/Src/../../../common/wire_codec.h:5:24:WireRead32	1
+../Core/Src/../../../common/wire_codec.h:8:20:WireWrite32	2
+../Core/Src/../../../common/wire_codec.h:13:24:WireCrc32	3
+../Core/Src/motor_journal.c:6:13:decode	14
+../Core/Src/motor_journal.c:25:6:MotorJournalLoad	12
+../Core/Src/motor_journal.c:54:6:MotorJournalIsNewOperation	7
+../Core/Src/motor_journal.c:61:6:MotorJournalSave	12

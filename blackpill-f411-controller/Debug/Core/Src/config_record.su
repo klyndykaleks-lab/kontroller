@@ -1,0 +1,6 @@
+../Core/Src/config_record.c:3:17:read32	16	static
+../Core/Src/config_record.c:6:13:write32	24	static
+../Core/Src/config_record.c:11:17:crc	24	static
+../Core/Src/config_record.c:21:13:valid	24	static
+../Core/Src/config_record.c:31:6:ConfigRecordEncode	48	static
+../Core/Src/config_record.c:53:6:ConfigRecordDecode	112	static

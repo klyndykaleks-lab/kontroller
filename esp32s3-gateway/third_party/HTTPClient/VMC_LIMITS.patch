@@ -1,0 +1,464 @@
+--- upstream/HTTPClient/src/HTTPClient.h	2026-03-13 12:01:19
++++ firmware/esp32s3-gateway/third_party/HTTPClient/src/HTTPClient.h	2026-09-20 02:22:51
+@@ -55,6 +55,8 @@
+ #define HTTPC_ERROR_ENCODING            (-9)
+ #define HTTPC_ERROR_STREAM_WRITE        (-10)
+ #define HTTPC_ERROR_READ_TIMEOUT        (-11)
++#define HTTPC_ERROR_RESPONSE_TOO_LARGE  (-12)
++#define HTTPC_ERROR_OPERATION_TIMEOUT   (-13)
+
+ /// size for the stream handling
+ #define HTTP_TCP_RX_BUFFER_SIZE (4096)
+@@ -215,6 +217,11 @@
+   void setAuthorizationType(const char *authType);
+   void setConnectTimeout(int32_t connectTimeout);
+   void setTimeout(uint16_t timeout);
++  void setOperationLimits(uint32_t operationTimeoutMs,
++                          uint32_t responseHeaderTimeoutMs,
++                          size_t maxResponseHeaderBytes,
++                          uint32_t responseBodyTimeoutMs,
++                          size_t maxResponseBodyBytes);
+
+   // Redirections
+   void setFollowRedirects(followRedirects_t follow);
+@@ -253,6 +260,7 @@
+   NetworkClient *getStreamPtr(void);
+   int writeToStream(Stream *stream);
+   String getString(void);
++  bool getJsonBodyBounded(String &body);
+
+   static String errorToString(int error);
+
+@@ -275,6 +283,10 @@
+   bool sendHeader(const char *type);
+   int handleHeaderResponse();
+   int writeToStreamDataBlock(Stream *stream, int len);
++  int readByteUntil(uint32_t deadlineMs);
++  int readLineUntil(String &line, uint32_t deadlineMs,
++                    size_t &totalBytes, size_t maxTotalBytes);
++  uint32_t boundedDeadline(uint32_t stageTimeoutMs) const;
+
+   /// Cookie jar support
+   void setCookie(String date, String headerValue);
+@@ -293,6 +305,12 @@
+   int32_t _connectTimeout = HTTPCLIENT_DEFAULT_TCP_TIMEOUT;
+   bool _reuse = true;
+   uint16_t _tcpTimeout = HTTPCLIENT_DEFAULT_TCP_TIMEOUT;
++  uint32_t _operationTimeoutMs = 0;
++  uint32_t _responseHeaderTimeoutMs = 0;
++  uint32_t _responseBodyTimeoutMs = 0;
++  size_t _maxResponseHeaderBytes = SIZE_MAX;
++  size_t _maxResponseBodyBytes = SIZE_MAX;
++  uint32_t _operationDeadlineMs = 0;
+   bool _useHTTP10 = false;
+   bool _secure = false;
+   bool _collectAllHeaders = false;
+--- upstream/HTTPClient/src/HTTPClient.cpp	2026-03-13 12:01:19
++++ firmware/esp32s3-gateway/third_party/HTTPClient/src/HTTPClient.cpp	2026-09-20 02:24:13
+@@ -477,9 +477,56 @@
+   _tcpTimeout = timeout;
+   if (connected()) {
+     _client->setTimeout(timeout);
++  }
++}
++
++void HTTPClient::setOperationLimits(uint32_t operationTimeoutMs,
++                                    uint32_t responseHeaderTimeoutMs,
++                                    size_t maxResponseHeaderBytes,
++                                    uint32_t responseBodyTimeoutMs,
++                                    size_t maxResponseBodyBytes) {
++  _operationTimeoutMs = operationTimeoutMs;
++  _responseHeaderTimeoutMs = responseHeaderTimeoutMs;
++  _maxResponseHeaderBytes = maxResponseHeaderBytes;
++  _responseBodyTimeoutMs = responseBodyTimeoutMs;
++  _maxResponseBodyBytes = maxResponseBodyBytes;
++}
++
++uint32_t HTTPClient::boundedDeadline(uint32_t stageTimeoutMs) const {
++  const uint32_t stageDeadline = millis() + stageTimeoutMs;
++  if (_operationDeadlineMs != 0 &&
++      static_cast<int32_t>(_operationDeadlineMs - stageDeadline) < 0) {
++    return _operationDeadlineMs;
++  }
++  return stageDeadline;
++}
++
++int HTTPClient::readByteUntil(uint32_t deadlineMs) {
++  for (;;) {
++    if (static_cast<int32_t>(deadlineMs - millis()) <= 0) {
++      return HTTPC_ERROR_OPERATION_TIMEOUT;
++    }
++    if (!_client || !connected()) return HTTPC_ERROR_CONNECTION_LOST;
++    if (_client->available()) return _client->read();
++    delay(1);
+   }
+ }
+
++int HTTPClient::readLineUntil(String &line, uint32_t deadlineMs,
++                              size_t &totalBytes, size_t maxTotalBytes) {
++  line = String();
++  for (;;) {
++    const int value = readByteUntil(deadlineMs);
++    if (value < 0) return value;
++    if (++totalBytes > maxTotalBytes) return HTTPC_ERROR_RESPONSE_TOO_LARGE;
++    if (value == '\n') {
++      line.trim();
++      return 0;
++    }
++    line += static_cast<char>(value);
++  }
++}
++
+ /**
+  * use HTTP1.0
+  * @param use
+@@ -577,6 +624,8 @@
+     if (!connect()) {
+       return returnError(HTTPC_ERROR_CONNECTION_REFUSED);
+     }
++    _operationDeadlineMs =
++        _operationTimeoutMs == 0 ? 0 : millis() + _operationTimeoutMs;
+
+     if (payload && size > 0) {
+       addHeader(F("Content-Length"), String(size));
+@@ -597,9 +646,21 @@
+     if (payload && size > 0) {
+       size_t sent_bytes = 0;
+       while (sent_bytes < size) {
++        if (_operationDeadlineMs != 0) {
++          const int32_t remaining =
++              static_cast<int32_t>(_operationDeadlineMs - millis());
++          if (remaining <= 0) {
++            return returnError(HTTPC_ERROR_OPERATION_TIMEOUT);
++          }
++          _client->setTimeout(static_cast<uint32_t>(remaining));
++        }
+         size_t sent = _client->write(&payload[sent_bytes], size - sent_bytes);
+         if (sent == 0) {
+           log_w("Failed to send chunk! Lets wait a bit");
++          if (_operationDeadlineMs != 0 &&
++              static_cast<int32_t>(_operationDeadlineMs - millis()) <= 100) {
++            return returnError(HTTPC_ERROR_OPERATION_TIMEOUT);
++          }
+           delay(100);
+           sent = _client->write(&payload[sent_bytes], size - sent_bytes);
+           if (sent == 0) {
+@@ -959,6 +1020,118 @@
+   }
+
+   return "";
++}
++
++bool HTTPClient::getJsonBodyBounded(String &body) {
++  body = String();
++  if (!connected()) return false;
++  if (_size > 0 && static_cast<size_t>(_size) > _maxResponseBodyBytes) {
++    returnError(HTTPC_ERROR_RESPONSE_TOO_LARGE);
++    return false;
++  }
++
++  const uint32_t deadline =
++      boundedDeadline(_responseBodyTimeoutMs == 0
++                          ? _tcpTimeout
++                          : _responseBodyTimeoutMs);
++  bool jsonStarted = false;
++  bool inString = false;
++  bool escaped = false;
++  int depth = 0;
++  auto appendDecoded = [&](char value) {
++    if (body.length() >= _maxResponseBodyBytes) return false;
++    body += value;
++    if (!jsonStarted) {
++      if (value == '{' || value == '[') {
++        jsonStarted = true;
++        depth = 1;
++      }
++      return true;
++    }
++    if (inString) {
++      if (escaped) escaped = false;
++      else if (value == '\\') escaped = true;
++      else if (value == '"') inString = false;
++    } else if (value == '"') {
++      inString = true;
++    } else if (value == '{' || value == '[') {
++      ++depth;
++    } else if (value == '}' || value == ']') {
++      --depth;
++    }
++    return true;
++  };
++
++  if (_transferEncoding == HTTPC_TE_IDENTITY) {
++    int remaining = _size;
++    for (;;) {
++      if (remaining == 0) return jsonStarted && depth == 0 && !inString;
++      const int value = readByteUntil(deadline);
++      if (value < 0) {
++        returnError(value);
++        return false;
++      }
++      if (!appendDecoded(static_cast<char>(value))) {
++        returnError(HTTPC_ERROR_RESPONSE_TOO_LARGE);
++        return false;
++      }
++      if (remaining > 0) --remaining;
++      if (_size < 0 && jsonStarted && depth == 0 && !inString) {
++        // JSON gives unknown-length responses an unambiguous application frame.
++        _canReuse = false;
++        return true;
++      }
++    }
++  }
++
++  if (_transferEncoding != HTTPC_TE_CHUNKED) {
++    returnError(HTTPC_ERROR_ENCODING);
++    return false;
++  }
++
++  size_t framingBytes = 0;
++  for (;;) {
++    String chunkHeader;
++    const int lineResult =
++        readLineUntil(chunkHeader, deadline, framingBytes, 4096);
++    if (lineResult < 0) {
++      returnError(lineResult);
++      return false;
++    }
++    char *end = nullptr;
++    const unsigned long chunkLength = strtoul(chunkHeader.c_str(), &end, 16);
++    if (end == chunkHeader.c_str() ||
++        (*end != '\0' && *end != ';') ||
++        chunkLength > _maxResponseBodyBytes - body.length()) {
++      returnError(HTTPC_ERROR_RESPONSE_TOO_LARGE);
++      return false;
++    }
++    if (chunkLength == 0) {
++      // Consume bounded optional trailers through their terminating blank line.
++      do {
++        const int trailerResult =
++            readLineUntil(chunkHeader, deadline, framingBytes, 4096);
++        if (trailerResult < 0) {
++          returnError(trailerResult);
++          return false;
++        }
++      } while (chunkHeader.length() != 0);
++      return jsonStarted && depth == 0 && !inString;
++    }
++    for (unsigned long i = 0; i < chunkLength; ++i) {
++      const int value = readByteUntil(deadline);
++      if (value < 0 || !appendDecoded(static_cast<char>(value))) {
++        returnError(value < 0 ? value : HTTPC_ERROR_RESPONSE_TOO_LARGE);
++        return false;
++      }
++    }
++    const int cr = readByteUntil(deadline);
++    const int lf = readByteUntil(deadline);
++    if (cr != '\r' || lf != '\n') {
++      returnError(HTTPC_ERROR_READ_TIMEOUT);
++      return false;
++    }
++  }
+ }
+
+ /**
+@@ -979,6 +1152,8 @@
+     case HTTPC_ERROR_ENCODING:            return F("Transfer-Encoding not supported");
+     case HTTPC_ERROR_STREAM_WRITE:        return F("Stream write error");
+     case HTTPC_ERROR_READ_TIMEOUT:        return F("read Timeout");
++    case HTTPC_ERROR_RESPONSE_TOO_LARGE:  return F("response too large");
++    case HTTPC_ERROR_OPERATION_TIMEOUT:   return F("operation timeout");
+     default:                              return String();
+   }
+ }
+@@ -1171,6 +1346,13 @@
+
+   header += _headers + "\r\n";
+
++  if (_operationDeadlineMs != 0) {
++    const int32_t remaining =
++        static_cast<int32_t>(_operationDeadlineMs - millis());
++    if (remaining <= 0) return false;
++    _client->setTimeout(static_cast<uint32_t>(remaining));
++  }
++
+   return (_client->write((const uint8_t *)header.c_str(), header.length()) == header.length());
+ }
+
+@@ -1179,118 +1361,88 @@
+  * @return int http code
+  */
+ int HTTPClient::handleHeaderResponse() {
++  if (!connected()) return HTTPC_ERROR_NOT_CONNECTED;
+
+-  if (!connected()) {
+-    return HTTPC_ERROR_NOT_CONNECTED;
+-  }
+-
+   _returnCode = 0;
+   _size = -1;
+   _canReuse = _reuse;
++  _transferEncoding = HTTPC_TE_IDENTITY;
+
+   String transferEncoding;
+-
+-  _transferEncoding = HTTPC_TE_IDENTITY;
+-  unsigned long lastDataTime = millis();
+-  bool firstLine = true;
+   String date;
++  bool firstLine = true;
++  size_t headerBytes = 0;
++  const uint32_t headerDeadline =
++      boundedDeadline(_responseHeaderTimeoutMs == 0
++                          ? _tcpTimeout
++                          : _responseHeaderTimeoutMs);
+
+   while (connected()) {
+-    size_t len = _client->available();
+-    if (len > 0) {
+-      String headerLine = _client->readStringUntil('\n');
+-      headerLine.trim();  // remove \r
++    String headerLine;
++    const int readResult = readLineUntil(
++        headerLine, headerDeadline, headerBytes, _maxResponseHeaderBytes);
++    if (readResult < 0) return readResult;
+
+-      lastDataTime = millis();
+-
+-      log_v("RX: '%s'", headerLine.c_str());
+-
+-      if (firstLine) {
+-        firstLine = false;
+-        if (_canReuse && headerLine.startsWith("HTTP/1.")) {
+-          _canReuse = (headerLine[sizeof "HTTP/1." - 1] != '0');
+-        }
+-        int codePos = headerLine.indexOf(' ') + 1;
+-        _returnCode = headerLine.substring(codePos, headerLine.indexOf(' ', codePos)).toInt();
+-      } else if (headerLine.indexOf(':')) {
+-        String headerName = headerLine.substring(0, headerLine.indexOf(':'));
+-        String headerValue = headerLine.substring(headerLine.indexOf(':') + 1);
+-        headerValue.trim();
+-
+-        if (headerName.equalsIgnoreCase("Date")) {
+-          date = headerValue;
+-        }
+-
+-        if (headerName.equalsIgnoreCase("Content-Length")) {
+-          _size = headerValue.toInt();
+-        }
+-
+-        if (_canReuse && headerName.equalsIgnoreCase("Connection")) {
+-          if (headerValue.indexOf("close") >= 0 && headerValue.indexOf("keep-alive") < 0) {
+-            _canReuse = false;
+-          }
+-        }
+-
+-        if (headerName.equalsIgnoreCase("Transfer-Encoding")) {
+-          transferEncoding = headerValue;
+-        }
+-
+-        if (headerName.equalsIgnoreCase("Location")) {
+-          _location = headerValue;
+-        }
++    log_v("RX: '%s'", headerLine.c_str());
++    if (firstLine) {
++      firstLine = false;
++      if (_canReuse && headerLine.startsWith("HTTP/1.")) {
++        _canReuse = (headerLine[sizeof "HTTP/1." - 1] != '0');
++      }
++      const int codePos = headerLine.indexOf(' ') + 1;
++      _returnCode =
++          headerLine.substring(codePos, headerLine.indexOf(' ', codePos)).toInt();
++    } else if (headerLine.indexOf(':') > 0) {
++      String headerName = headerLine.substring(0, headerLine.indexOf(':'));
++      String headerValue = headerLine.substring(headerLine.indexOf(':') + 1);
++      headerValue.trim();
+
+-        if (headerName.equalsIgnoreCase("Set-Cookie")) {
+-          setCookie(date, headerValue);
++      if (headerName.equalsIgnoreCase("Date")) date = headerValue;
++      if (headerName.equalsIgnoreCase("Content-Length")) {
++        _size = headerValue.toInt();
++        if (_size < 0 ||
++            static_cast<size_t>(_size) > _maxResponseBodyBytes) {
++          return HTTPC_ERROR_RESPONSE_TOO_LARGE;
+         }
++      }
++      if (_canReuse && headerName.equalsIgnoreCase("Connection") &&
++          headerValue.indexOf("close") >= 0 &&
++          headerValue.indexOf("keep-alive") < 0) {
++        _canReuse = false;
++      }
++      if (headerName.equalsIgnoreCase("Transfer-Encoding")) {
++        transferEncoding = headerValue;
++      }
++      if (headerName.equalsIgnoreCase("Location")) _location = headerValue;
++      if (headerName.equalsIgnoreCase("Set-Cookie")) {
++        setCookie(date, headerValue);
++      }
+
+-        if (_collectAllHeaders && headerName.length() > 0) {
+-          _currentHeaders.emplace_back(headerName, headerValue);
+-        } else {
+-          for (size_t i = 0; i < _currentHeaders.size(); ++i) {
+-            if (_currentHeaders[i].key.equalsIgnoreCase(headerName)) {
+-              _currentHeaders[i].value = headerValue;
+-              break;  // We found a match, stop looking
+-            }
++      if (_collectAllHeaders && headerName.length() > 0) {
++        _currentHeaders.emplace_back(headerName, headerValue);
++      } else {
++        for (size_t i = 0; i < _currentHeaders.size(); ++i) {
++          if (_currentHeaders[i].key.equalsIgnoreCase(headerName)) {
++            _currentHeaders[i].value = headerValue;
++            break;
+           }
+         }
+       }
++    }
+
+-      if (headerLine == "") {
+-        log_d("code: %d", _returnCode);
+-
+-        if (_size > 0) {
+-          log_d("size: %d", _size);
+-        }
+-
+-        if (transferEncoding.length() > 0) {
+-          log_d("Transfer-Encoding: %s", transferEncoding.c_str());
+-          if (transferEncoding.equalsIgnoreCase("chunked")) {
+-            _transferEncoding = HTTPC_TE_CHUNKED;
+-          } else if (transferEncoding.equalsIgnoreCase("identity")) {
+-            _transferEncoding = HTTPC_TE_IDENTITY;
+-          } else {
+-            return HTTPC_ERROR_ENCODING;
+-          }
+-        } else {
++    if (headerLine == "") {
++      if (transferEncoding.length() > 0) {
++        if (transferEncoding.equalsIgnoreCase("chunked")) {
++          _transferEncoding = HTTPC_TE_CHUNKED;
++        } else if (transferEncoding.equalsIgnoreCase("identity")) {
+           _transferEncoding = HTTPC_TE_IDENTITY;
+-        }
+-
+-        if (_returnCode) {
+-          return _returnCode;
+         } else {
+-          log_d("Remote host is not an HTTP Server!");
+-          return HTTPC_ERROR_NO_HTTP_SERVER;
++          return HTTPC_ERROR_ENCODING;
+         }
+       }
+-
+-    } else {
+-      if ((millis() - lastDataTime) > _tcpTimeout) {
+-        return HTTPC_ERROR_READ_TIMEOUT;
+-      }
+-      delay(10);
++      return _returnCode ? _returnCode : HTTPC_ERROR_NO_HTTP_SERVER;
+     }
+   }
+-
+   return HTTPC_ERROR_CONNECTION_LOST;
+ }

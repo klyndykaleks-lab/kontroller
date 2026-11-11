@@ -1,0 +1,9 @@
+../Core/Inc/lock_control.h:11:20:LockControlStep	32	static
+../Core/Src/main_io.c:7:6:MainIoInit	4	static
+../Core/Src/main_io.c:8:6:MainIoStopForMaintenance	24	static,ignoring_inline_asm
+../Core/Src/main_io.c:14:6:MainIoTick	16	static
+../Core/Src/main_io.c:22:6:MainDropBlocked	8	static
+../Core/Src/main_io.c:23:6:MainDropArm	32	static,ignoring_inline_asm
+../Core/Src/main_io.c:30:6:MainDropDisarm	4	static
+../Core/Src/main_io.c:31:6:MainDropDetected	16	static
+../Core/Src/main_io.c:34:6:HAL_GPIO_EXTI_Callback	24	static
