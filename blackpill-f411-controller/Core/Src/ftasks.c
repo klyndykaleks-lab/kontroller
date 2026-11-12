@@ -16,17 +16,15 @@
 #include "cmsis_os.h"
 #include "main.h"
 #include "main_io.h"
+#include "esp_link.h"
 
 #define KEYPAD_POLL_RATE_MS      (20U)
 #define DEBOUNCE_THRESHOLD       (3U)
-#define PAYMENT_WAIT_TIMEOUT_MS  (100000U)
+#define PAYMENT_WAIT_TIMEOUT_MS  (60000U)
 #define PAYMENT_RECOVERY_TIMEOUT_MS (PAYMENT_WAIT_TIMEOUT_MS + 5000U)
 #define VENDING_TIMEOUT_MS       (13000U)
 #define MACHINE_RESULT_TIMEOUT_MS (60000U)
 #define SELECTION_RETRY_BLOCK_MS (5000U)
-#define USB_TX_RETRY_COUNT       (10U)
-#define USB_TX_RETRY_DELAY_MS    (5U)
-#define ESP_UART_TX_TIMEOUT_MS   (100U)
 #define ESP_UART_LINE_BUFFER_SIZE (128U)
 #define USB_TX_OUTBOX_CAPACITY   (32U)
 #define USB_TX_OUTBOX_RETRY_MS   (20U)
@@ -91,6 +89,8 @@ static MachineVendStatus_t machineVendStatus = MACHINE_VEND_UNKNOWN;
 static bool transactionActive = false;
 static uint32_t maintenanceToken, maintenanceSince, maintenanceNext;
 static uint8_t maintenancePhase;
+static bool maintenanceResetPending;
+static uint32_t maintenanceResetDeadline;
 static volatile bool maintenanceForced;
 
 static bool paymentCancelledByMachine = false;
@@ -122,16 +122,6 @@ typedef enum {
 } UsbTxStatus_t;
 
 static UsbTxStatus_t lastUsbTxStatus = USB_TX_STATUS_OK;
-#define ESP_UART_DMA_CAPACITY 4096U
-static uint8_t espUartDmaBuffer[ESP_UART_DMA_CAPACITY];
-static volatile uint32_t espUartDmaWraps;
-static volatile bool espUartRxError;
-static uint32_t espUartRxConsumed;
-static bool espUartDiscardLine;
-static uint32_t espUartRxDrops;
-extern DMA_HandleTypeDef hdma_usart1_rx;
-static char espUartLineBuffer[ESP_UART_LINE_BUFFER_SIZE];
-static uint16_t espUartLineLength = 0;
 static char usbTxOutbox[USB_TX_OUTBOX_CAPACITY][ESP_UART_LINE_BUFFER_SIZE];
 static uint8_t usbTxOutboxHead = 0;
 static uint8_t usbTxOutboxTail = 0;
@@ -172,7 +162,7 @@ static uint8_t f411RejectBurst;
 static char f411LastReason[25]="none";
 static uint32_t f411RecoveryCount;
 static F411RecoveryTimer f411RecoveryTimer, f411TxRecoveryTimer;
-static uint32_t f411TxProgress;
+
 static uint32_t f411LastWorkProgressMs;
 static bool f411WorkTracked;
 static bool f411PaymentBudget;
@@ -208,6 +198,37 @@ static void F411ObserveWire(const MdbCashlessFsm_t*fsm,bool cachePending,bool co
  if(fsm->currentTransactionId)f411WireHealth.seenSelection=true;
  RestoreInterruptState(primask);
 }
+/* MDB owns the session flag; logger alone owns each in-flight SD operation.
+ * Completion never clears a payment block. Already-started I/O may finish. */
+volatile bool g_mdb_session_active = false;
+volatile uint32_t g_payment_request_tick = 0U;
+volatile uint32_t g_payment_result_tick = 0U;
+static volatile bool sdOperationBusy = false;
+
+static bool SdTryBeginOperation(void) {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    const bool permitted = !g_mdb_session_active && !sdOperationBusy;
+    if (permitted) sdOperationBusy = true;
+    RestoreInterruptState(primask);
+    return permitted;
+}
+
+static void SdCompleteOperation(void) {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    sdOperationBusy = false;
+    RestoreInterruptState(primask);
+}
+
+static void SdObserveMdbSession(const MdbCashlessFsm_t *fsm) {
+    /* OOS explicitly aborts the vend; denied/approved replies do not.
+     * Keep the block through END_SESSION ACK, including compatibility cancel. */
+    if (fsm->currentTransactionId == 0U || fsm->resetRequired ||
+        MdbFsmHasPendingResponse(fsm, MDB_POLL_COMMAND_OOS))
+        g_mdb_session_active = false;
+}
+
 static void SendF411State(void);
 static void ServiceF411Recovery(void);
 
@@ -920,22 +941,10 @@ static const char* MachineVendStatusToString(MachineVendStatus_t status) {
 	}
 }
 
-static UsbTxStatus_t GetUsbTxReadyStatus(void) {
-	if (huart1.Instance != USART1 || huart1.gState == HAL_UART_STATE_RESET) {
-		return USB_TX_STATUS_NOT_CONFIGURED;
-	}
-
-	if (huart1.gState != HAL_UART_STATE_READY) {
-		return USB_TX_STATUS_BUSY;
-	}
-
-	return USB_TX_STATUS_OK;
-}
-
 static const char* UsbTxStatusToDisplayLine(UsbTxStatus_t status) {
 	switch (status) {
 	case USB_TX_STATUS_OK:
-		return "UART TX PAY OK";
+		return "UART TX QUEUED";
 	case USB_TX_STATUS_BAD_LINE:
 		return "UART BAD LINE";
 	case USB_TX_STATUS_NOT_CONFIGURED:
@@ -949,41 +958,11 @@ static const char* UsbTxStatusToDisplayLine(UsbTxStatus_t status) {
 	}
 }
 
+/* Accepted means queued for transport, not acknowledged by ESP. */
 static bool UsbTrySendLine(const char *line) {
-	static char txBuffer[128];
-	int len;
-
-	lastUsbTxStatus = GetUsbTxReadyStatus();
-	if (lastUsbTxStatus != USB_TX_STATUS_OK) {
-		return false;
-	}
-
-	len = snprintf(txBuffer, sizeof(txBuffer), "%s\r\n", line);
-
-	if (len <= 0 || len >= (int)sizeof(txBuffer)) {
-		lastUsbTxStatus = USB_TX_STATUS_BAD_LINE;
-		return false;
-	}
-
-	for (uint32_t attempt = 0; attempt < USB_TX_RETRY_COUNT; attempt++) {
-		HAL_StatusTypeDef status = HAL_UART_Transmit(&huart1,
-				(uint8_t*)txBuffer, (uint16_t)len,
-				ESP_UART_TX_TIMEOUT_MS);
-		if (status == HAL_OK) {
-   const uint32_t primask=__get_PRIMASK();__disable_irq();++f411TxProgress;RestoreInterruptState(primask);
-			lastUsbTxStatus = USB_TX_STATUS_OK;
-			return true;
-		}
-		if (status != HAL_BUSY) {
-			lastUsbTxStatus = USB_TX_STATUS_ERROR;
-			return false;
-		}
-		lastUsbTxStatus = USB_TX_STATUS_BUSY;
-		osDelay(USB_TX_RETRY_DELAY_MS);
-	}
-
-	lastUsbTxStatus = USB_TX_STATUS_BUSY;
-	return false;
+    bool queued = EspLinkSendLine(line);
+    lastUsbTxStatus = queued ? USB_TX_STATUS_OK : USB_TX_STATUS_BUSY;
+    return queued;
 }
 
 static bool QueueUsbTxLine(const char *line) {
@@ -1070,95 +1049,11 @@ static bool UsbTxOutboxPending(void) {
 	return usbTxOutboxCount > 0U || usbTxCriticalDeliveryResultPending;
 }
 
-static void EspUartProcessByte(uint8_t byte) {
-	char ch = (char)byte;
-
-	if (espUartDiscardLine) {
-		if (ch == '\n') espUartDiscardLine = false;
-		return;
-	}
-
-	if (ch == '\r') {
-		return;
-	}
-
-	if (ch == '\n') {
-		if (espUartLineLength > 0U) {
-			espUartLineBuffer[espUartLineLength] = '\0';
-			UsbCdcProcessLine(espUartLineBuffer);
-			espUartLineLength = 0;
-		}
-		return;
-	}
-
-	if (espUartLineLength < (sizeof(espUartLineBuffer) - 1U)) {
-		espUartLineBuffer[espUartLineLength++] = ch;
-	} else {
-		espUartLineLength = 0;
-		espUartDiscardLine = true;
-		espUartRxDrops++;
-	}
-}
-
-void EspUartStartReceive(void) {
-	espUartLineLength = 0U;
-	espUartDmaWraps = 0U;
-	espUartRxConsumed = 0U;
-	espUartRxError = false;
-	if (HAL_UART_Receive_DMA(&huart1, espUartDmaBuffer, ESP_UART_DMA_CAPACITY) != HAL_OK) {
-		espUartRxError = true;
-	} else {
-		__HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
-	}
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart != NULL && huart->Instance == USART1) espUartDmaWraps++;
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-	if (huart != NULL && huart->Instance == USART1) espUartRxError = true;
-}
-
-static uint32_t EspUartProduced(void) {
-	uint32_t primask = __get_PRIMASK();
-	__disable_irq();
-	uint32_t wraps = espUartDmaWraps;
-	uint32_t remaining = __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
-	/* DMA keeps running during bit-banged MDB IRQ masking. Account for an
-	 * already wrapped buffer whose completion ISR has not run yet. */
-	if (__HAL_DMA_GET_FLAG(&hdma_usart1_rx, DMA_FLAG_TCIF2_6) != RESET) {
-		remaining = __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
-		if (remaining != 0U) wraps++;
-	}
-	__DMB();
-	RestoreInterruptState(primask);
-	return wraps * ESP_UART_DMA_CAPACITY + ESP_UART_DMA_CAPACITY - remaining;
-}
-
-static void ServiceEspUartReceive(void) {
-	if (espUartRxError) {
-		HAL_UART_AbortReceive(&huart1);
-		espUartDiscardLine = true;
-		espUartRxDrops++;
-		EspUartStartReceive();
-		return;
-	}
-	uint32_t produced = EspUartProduced();
-	if ((produced - espUartRxConsumed) >= ESP_UART_DMA_CAPACITY) {
-		espUartRxConsumed = produced;
-		espUartLineLength = 0U;
-		espUartDiscardLine = true;
-		espUartRxDrops++;
-		return;
-	}
-	/* Parse in manager context, never in a UART/DMA ISR. */
-	uint32_t budget = 256U;
-	while (espUartRxConsumed != produced && budget-- != 0U) {
-		uint8_t byte = espUartDmaBuffer[espUartRxConsumed % ESP_UART_DMA_CAPACITY];
-		espUartRxConsumed++;
-		EspUartProcessByte(byte);
-	}
+/* Only manager parses private protocol and changes payment/motor state. */
+static void ServiceEspInputLines(void) {
+    char line[ESP_LINK_LINE_SIZE];
+    for (unsigned budget = 0U; budget < 8U && EspLinkReceiveLine(line); ++budget)
+        UsbCdcProcessLine(line);
 }
 
 static void FormatFiveDigitValue(char *dest, uint16_t value) {
@@ -1636,6 +1531,7 @@ static void SendControllerBootDiagnostic(void) {
 			(unsigned)F411_GetResetFlags(), F411_GetResetReason(),
 			(unsigned)F411_GetResetFlags());
 	UsbSendLine(usbLine);
+	UsbSendLine("CONTROLLER_DIAGNOSTIC,source=f411,event=build,line=0,count=1,status=esp-async-v1");
 }
 
 static void SendControllerStorageDiagnostic(void) {
@@ -1888,7 +1784,7 @@ static void StartVendSession(uint16_t selectionId, uint16_t priceMinor,
 			(unsigned)(activeMotorIndex < 0 ? 0 : activeMotorIndex + 1),
 			(unsigned long)F411_GetBootIdentity());
 	usbSent = UsbSendLine(usbLine);
-	SendUsbTransactionStatus(usbSent ? "UART TX PAY OK" :
+	SendUsbTransactionStatus(usbSent ? "UART TX PAY QUEUED" :
 			UsbTxStatusToDisplayLine(lastUsbTxStatus),
 			selectionId, priceMinor, activeMotorIndex);
 }
@@ -2102,6 +1998,12 @@ static bool MaintenanceTokenParse(const char *line,const char *prefix,uint32_t *
 static void MaintenanceService(void) {
     if (!maintenancePhase) return;
     uint32_t now=HAL_GetTick();
+    if (maintenanceResetPending) {
+        if (EspLinkTxIdle() || (int32_t)(now-maintenanceResetDeadline)>=0) {
+            __DSB();NVIC_SystemReset();
+        }
+        return;
+    }
     if ((uint32_t)(now-maintenanceSince)>=30000U) {
         MaintenanceMessage("REBOOT_FAILED","controllerAckTimeout");
         maintenancePhase=0U;__DSB();NVIC_SystemReset();return;
@@ -2123,9 +2025,9 @@ static bool MaintenanceHandleLine(const char *line) {
    return true;
  }
  if(MaintenanceTokenParse(line,"REBOOT_FORCE_CONTROLLER_ACK,token=",&rebootToken)) {
-   if(maintenancePhase==3U && rebootToken==maintenanceToken) {
+   if(maintenancePhase==3U && rebootToken==maintenanceToken && !maintenanceResetPending) {
       MaintenanceMessage("REBOOT_BLACK_READY",NULL);
-      __DSB();NVIC_SystemReset();
+      maintenanceResetPending=true;maintenanceResetDeadline=HAL_GetTick()+1000U;
    }
    return true;
  }
@@ -2272,7 +2174,7 @@ static void ServiceF411Recovery(void) {
  /* PAYMENT timeout -> pending report must not restart the same no-progress budget. */
  uint32_t primask=__get_PRIMASK();__disable_irq();
  wire=f411WireHealth;progress=f411Progress;rejected=f411RejectBurst;
- const uint32_t txProgress=f411TxProgress,workProgressMs=f411LastWorkProgressMs;
+ const uint32_t txProgress=EspLinkGetStats().txCompleted,workProgressMs=f411LastWorkProgressMs;
  const bool workTracked=f411WorkTracked,paymentBudget=f411PaymentBudget;
  now=HAL_GetTick(); /* Snapshot timestamps cannot be newer than this sample. */
  const bool recentReject=(uint32_t)(now-f411LastRejectMs)<=10000U;
@@ -2294,14 +2196,15 @@ static void ServiceF411Recovery(void) {
  bool due=F411RecoveryDue(&f411RecoveryTimer,now,blocked,progress);
  if(rejectionLoop&&!wasArmed&&f411RecoveryTimer.armed){f411RecoveryTimer.since=firstRejectMs;due=(int32_t)(now-firstRejectMs)>=(int32_t)F411_RECOVERY_DELAY_MS;}
  const bool txStuck=F411RecoveryDue(&f411TxRecoveryTimer,now,
-  usbTxOutboxCount!=0U||usbTxCriticalDeliveryResultPending||vendReportPending,txProgress);
+  !EspLinkTxIdle()||usbTxOutboxCount!=0U||usbTxCriticalDeliveryResultPending||vendReportPending,txProgress);
  if(!protectedPayment&&(due||activeStuck||txStuck)) {
   char line[128];const char*reason=txStuck?"uartTxStuck":(activeStuck?"managerStateStuck":(vendReportPending?"vendReportPending":
    (usbTxCriticalDeliveryResultPending?"criticalResultPending":
    (wire.resetRequired?"mdbResetRequired":(cacheStuck?"mdbCacheStuck":"rejectedLoop")))));
   ++f411RecoveryCount;
   snprintf(line,sizeof(line),"F411_RECOVER,b=%lu,r=%s,t=%lu",(unsigned long)F411_GetBootIdentity(),reason,(unsigned long)activeMdbTransactionId);
-  /* Best effort boundedUART write, not the possibly stuck queue. Never restart a motor. */
+  /* Best effort enqueue; immediate recovery reset can discard diagnostics.
+   * Final outcomes remain the responsibility of the existing persistent journals. */
   (void)UsbTrySendLine(line);
   NVIC_SystemReset();
  }
@@ -2316,7 +2219,6 @@ void managerTask(void *argument) {
 	osDelay(5000);
 	SendStatusUpdate("MANAGER START", "UART INIT");
 	osDelay(100);
-	EspUartStartReceive();
 	SendControllerBootDiagnostic();
 	SendStatusUpdate("UART READY", "CFG WAIT");
 	osDelay(100);
@@ -2329,7 +2231,7 @@ void managerTask(void *argument) {
 
 	for (;;) {
 		F411_WatchdogServiceFromManager();
-		ServiceEspUartReceive();
+		ServiceEspInputLines();
   MaintenanceService();
   if(maintenanceForced){osDelay(1U);continue;}
   ServiceF411Recovery();
@@ -4185,6 +4087,7 @@ void mdbTask(void *argument) {
 		uint8_t subCommand;
 		int rxResult;
 
+		SdObserveMdbSession(&fsm);
 		F411_MdbHeartbeat();
   if(maintenanceForced){osDelay(1U);continue;}
   F411ObserveWire(&fsm,mdbResponseCache.valid&&mdbResponseCache.pollReplyPending,false);
@@ -4207,6 +4110,8 @@ void mdbTask(void *argument) {
 		if (TakeMdbPaymentMailbox(&payment)) {
 			MdbFsmAction_t paymentAction = MdbFsmApplyPaymentResult(&fsm,
 					payment.transactionId, payment.resultCode);
+            if (paymentAction == MDB_FSM_ACCEPTED)
+                g_payment_result_tick = HAL_GetTick();
 			MdbTraceRecordEvent(
 					(paymentAction == MDB_FSM_STALE) ? MDB_TRACE_STALE_RESULT
 							: ((paymentAction == MDB_FSM_QUEUE_FULL)
@@ -4467,6 +4372,9 @@ void mdbTask(void *argument) {
 						(uint8_t)action, 0U,
 						selectionId);
 				if (action == MDB_FSM_ACCEPTED) {
+                    g_mdb_session_active = true;
+                    g_payment_request_tick = HAL_GetTick();
+                    g_payment_result_tick = 0U;
 					SendUsbTransactionStatus("MDB VEND REQ", selectionId,
 							priceMinor, FindMotorBySelectionId(selectionId));
 					MdbFsmSetDeadline(&fsm, HAL_GetTick(), PAYMENT_WAIT_TIMEOUT_MS);
@@ -4921,13 +4829,19 @@ void loggerTask(void *argument) {
 
 	// 3. Главный цикл (работает всегда, даже если sd_ok == false)
 	// Это нужно, чтобы вычитывать очередь и не забивать память, даже если писать некуда.
+    bool commandPending = false;
 	for (;;) {
-		if (osMessageQueueGet(logQueueHandle, &rxCmd, NULL, osWaitForever)
-				== osOK) {
-
-			// Если карты нет - просто игнорируем команды (имитируем работу)
-			if (!sd_ok)
-				continue;
+        if (!commandPending)
+            commandPending = osMessageQueueGet(logQueueHandle, &rxCmd, NULL,
+                                               osWaitForever) == osOK;
+        if (commandPending) {
+            if (!sd_ok) { commandPending = false; continue; }
+            if (!SdTryBeginOperation()) {
+                /* Preserve FIFO order and retry even if no further event arrives. */
+                osDelay(10U);
+                continue;
+            }
+            commandPending = false;
 
 			if (rxCmd.type == CMD_CONFIG_SAVE) {
 				if (!StoreConfigRecord(&rxCmd.payload.configData)) {
@@ -4959,6 +4873,7 @@ void loggerTask(void *argument) {
 					// Но FatFs может восстановиться при следующем вызове, поэтому просто игнорируем.
 				}
 			}
+            SdCompleteOperation();
 		}
 	}
 }

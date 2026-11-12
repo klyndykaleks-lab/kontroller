@@ -22,6 +22,7 @@
 #include "main.h"
 
 DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart1_tx;
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
@@ -284,6 +285,22 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
 
+    /* USART1_TX: DMA2 stream 7/channel 4, separate from circular RX. */
+    hdma_usart1_tx.Instance = DMA2_Stream7;
+    hdma_usart1_tx.Init.Channel = DMA_CHANNEL_4;
+    hdma_usart1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_usart1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart1_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.Mode = DMA_NORMAL;
+    hdma_usart1_tx.Init.Priority = DMA_PRIORITY_MEDIUM;
+    hdma_usart1_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart1_tx) != HAL_OK) Error_Handler();
+    __HAL_LINKDMA(huart, hdmatx, hdma_usart1_tx);
+    HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+
     /* USART1 interrupt Init */
     HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
@@ -353,6 +370,8 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     HAL_NVIC_DisableIRQ(USART1_IRQn);
     HAL_NVIC_DisableIRQ(DMA2_Stream2_IRQn);
     HAL_DMA_DeInit(huart->hdmarx);
+    HAL_NVIC_DisableIRQ(DMA2_Stream7_IRQn);
+    HAL_DMA_DeInit(huart->hdmatx);
     /* USER CODE BEGIN USART1_MspDeInit 1 */
 
     /* USER CODE END USART1_MspDeInit 1 */

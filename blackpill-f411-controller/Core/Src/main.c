@@ -20,6 +20,7 @@
 #include "main.h"
 #include "main_io.h"
 #include "boot_identity.h"
+#include "esp_link.h"
 #include "cmsis_os.h"
 #include "fatfs.h"
 #include "usb_device.h"
@@ -60,6 +61,12 @@ UART_HandleTypeDef huart2;
 osThreadId_t managerHandle;
 const osThreadAttr_t manager_attributes = {
   .name = "manager",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+static osThreadId_t espLinkHandle;
+static const osThreadAttr_t espLink_attributes = {
+  .name = "espLink",
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
@@ -342,8 +349,12 @@ int main(void)
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
+  if (!EspLinkInit()) Error_Handler();
+
   /* Create the thread(s) */
   /* creation of manager */
+  espLinkHandle = osThreadNew(espLinkTask, NULL, &espLink_attributes);
+  if (!espLinkHandle) Error_Handler();
   managerHandle = osThreadNew(managerTask, NULL, &manager_attributes);
 
   /* creation of keypad */
