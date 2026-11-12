@@ -9,7 +9,6 @@ void displayTask(void *argument);
 void loggerTask(void *argument);
 void climatTask(void *argument);
 void latchTask(void *argument);
-void EspUartStartReceive(void);
 void UsbCdcProcessLine(const char *line);
 bool QueueManagerEvent(const event_t *event);
 void F411_MdbHeartbeat(void);

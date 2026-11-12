@@ -235,3 +235,6 @@ void EXTI15_10_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15); }
 /* Dedicated MDB RX handler: USART1 remains the ESP HAL/DMA transport. */
 extern void MdbUart2IRQ(void);
 void USART2_IRQHandler(void) { MdbUart2IRQ(); }
+
+extern DMA_HandleTypeDef hdma_usart1_tx;
+void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }

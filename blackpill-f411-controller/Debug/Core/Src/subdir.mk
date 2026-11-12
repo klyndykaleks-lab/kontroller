@@ -10,6 +10,7 @@ C_SRCS += \
 ../Core/Src/boot_identity.c \
 ../Core/Src/config_record.c \
 ../Core/Src/ftasks.c \
+../Core/Src/esp_link.c \
 ../Core/Src/keypad.c \
 ../Core/Src/lcd.c \
 ../Core/Src/main.c \
@@ -28,6 +29,7 @@ OBJS += \
 ./Core/Src/boot_identity.o \
 ./Core/Src/config_record.o \
 ./Core/Src/ftasks.o \
+./Core/Src/esp_link.o \
 ./Core/Src/keypad.o \
 ./Core/Src/lcd.o \
 ./Core/Src/main.o \
@@ -46,6 +48,7 @@ C_DEPS += \
 ./Core/Src/boot_identity.d \
 ./Core/Src/config_record.d \
 ./Core/Src/ftasks.d \
+./Core/Src/esp_link.d \
 ./Core/Src/keypad.d \
 ./Core/Src/lcd.d \
 ./Core/Src/main.d \
